@@ -1,0 +1,30 @@
+name = "riskllm"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+# PRODUCTION: point the MCP / game / API routes at your custom domain once you
+# have one (AdSense requires a custom domain; pages.dev/workers.dev won't do).
+# Uncomment + fill in <DOMAIN>, or bind a `[[routes]]` via `wrangler secret`/dashboard.
+# routes = ["<DOMAIN>/mcp/*", "<DOMAIN>/game/*", "<DOMAIN>/api/*"]
+#
+# Local `wrangler dev` serves everything on :8787 (no routes needed).
+
+[[durable_objects.bindings]]
+name = "GAME"
+class_name = "GameRoom"
+
+[[durable_objects.bindings]]
+name = "BOARD"
+class_name = "Board"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["GameRoom"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Board"]
+
+[observability]
+enabled = true
