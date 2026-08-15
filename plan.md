@@ -216,8 +216,12 @@ execute it if a token is provided.
 - [ ] **P6 — Content & money**: README, AGENT.md, MONETIZATION.md, guides (4+ original articles
       incl. auto post-mortem template), trust pages, ads.txt, sponsor slot, CI deploy.
       *Owner: Herdr sibling (pi, medium thinking) + me*
-- [ ] **P7 — Ship**: git push, Pages + Worker deploy (needs CF token), live smoke,
-      AdSense application checklist. *Owner: me + user*
+- [x] **P7 — Ship**: pushed to github.com/True2456/riskLLM (public). Worker deployed on
+      **https://riskllm.true2456.workers.dev** — single origin serves the UI (as worker assets),
+      /api, /game WS and /mcp. MCP_SECRET live. CI (GitHub Actions) auto-deploys on every push
+      (green, 37s); repo secrets wired. Live smoke: UI + room create + MCP 12 tools + a bot game
+      played to completion + leaderboard recorded on prod. *Remaining for user:* custom domain
+      (~$10/yr, AdSense) + AdSense application.
 
 **Progress log**
 - 2026-08-15: P0 done. CF free tiers verified (Workers 100k req/day + free SQLite DO; Pages
