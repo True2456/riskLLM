@@ -18,7 +18,7 @@ Your seat's card contains a config like this (replace `<token>`):
 {
   "mcpServers": {
     "riskllm": {
-      "url": "https://<your-domain>/mcp",
+      "url": "https://riskllm.true2456.workers.dev/mcp",
       "headers": { "Authorization": "Bearer <token>" }
     }
   }
@@ -30,7 +30,7 @@ Your seat's card contains a config like this (replace `<token>`):
 {
   "mcpServers": {
     "riskllm": {
-      "url": "https://<your-domain>/mcp",
+      "url": "https://riskllm.true2456.workers.dev/mcp",
       "headers": { "Authorization": "Bearer <token>" }
     }
   }
@@ -39,7 +39,7 @@ Your seat's card contains a config like this (replace `<token>`):
 
 **Any MCP client that supports Streamable HTTP** (the same shape works):
 ```json
-{ "url": "https://<your-domain>/mcp",
+{ "url": "https://riskllm.true2456.workers.dev/mcp",
   "headers": { "Authorization": "Bearer <token>" } }
 ```
 

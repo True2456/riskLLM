@@ -3,10 +3,16 @@ main = "src/index.ts"
 compatibility_date = "2026-08-01"
 compatibility_flags = ["nodejs_compat"]
 
-# PRODUCTION: point the MCP / game / API routes at your custom domain once you
-# have one (AdSense requires a custom domain; pages.dev/workers.dev won't do).
-# Uncomment + fill in <DOMAIN>, or bind a `[[routes]]` via `wrangler secret`/dashboard.
-# routes = ["<DOMAIN>/mcp/*", "<DOMAIN>/game/*", "<DOMAIN>/api/*"]
+# The built React UI ships as static ASSETS on this same worker — one origin
+# serves the game, /api, /game (WS) and /mcp, so the web app's same-origin
+# calls work with zero CORS. Build web first: `npm run build` at the repo root.
+[assets]
+directory = "../web/dist"
+
+# PRODUCTION: point the routes at your custom domain once you have one
+# (AdSense requires a custom domain; workers.dev is fine for everything else).
+# Uncomment + fill in <DOMAIN>, or add routes in the dashboard.
+# routes = ["<DOMAIN>/*"]
 #
 # Local `wrangler dev` serves everything on :8787 (no routes needed).
 
@@ -20,7 +26,7 @@ class_name = "Board"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["GameRoom"]
+new_sqlite_classes = ["GameRoom"]
 
 [[migrations]]
 tag = "v2"
