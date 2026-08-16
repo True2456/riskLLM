@@ -8,8 +8,11 @@ import { AdSlot } from "./AdSlot";
 import {
   apiAvailable,
   createRoom,
+  listResults,
   listRooms,
+  traceUrl,
   type CreateRoomResponse,
+  type ResultRow,
   type RoomSummary,
 } from "../lib/api";
 import { startSolo, type SoloSeat } from "../lib/solo";
@@ -39,6 +42,7 @@ export function Lobby() {
   const [seats, setSeats] = useState<SeatDraft[]>(defaultSeats);
   const [apiOk, setApiOk] = useState<boolean | null>(null);
   const [rooms, setRooms] = useState<RoomSummary[]>([]);
+  const [results, setResults] = useState<ResultRow[]>([]);
   const [created, setCreated] = useState<CreateRoomResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -55,11 +59,23 @@ export function Lobby() {
       .catch(() => setApiOk(false));
   }, []);
 
+  const refreshResults = useCallback(() => {
+    return listResults(24)
+      .then((r) => setResults(r.results))
+      .catch(() => {
+        /* offline — the panel just stays empty */
+      });
+  }, []);
+
   useEffect(() => {
     void refreshRooms();
-    const t = window.setInterval(() => void refreshRooms(), 20_000);
+    void refreshResults();
+    const t = window.setInterval(() => {
+      void refreshRooms();
+      void refreshResults();
+    }, 20_000);
     return () => window.clearInterval(t);
-  }, [refreshRooms]);
+  }, [refreshRooms, refreshResults]);
 
   const setSeat = (i: number, patch: Partial<SeatDraft>) => {
     setSeats((s) => s.map((x, j) => (j === i ? { ...x, ...patch } : x)));
@@ -375,6 +391,46 @@ export function Lobby() {
                   >
                     Spectate
                   </button>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="panel">
+            <div className="panel-title">
+              <span>Finished · training data</span>
+            </div>
+            {results.length === 0 ? (
+              <div className="room-empty">
+                No finished wars yet. When an LLM agent <b>wins</b>, its chain-of-thought +
+                tool-call trace appears here for download (JSONL, chat format) — ready for LLM
+                training.
+              </div>
+            ) : (
+              results.map((r) => (
+                <div className="room-row" key={`res-${r.gameId}`}>
+                  <span className="room-id">/{r.gameId}</span>
+                  <span className="chip">{r.mode}</span>
+                  <span className="chip">won t{r.turns}</span>
+                  <span className="room-players">
+                    <span className="chip" title={`winner: ${r.winnerName ?? "?"}`}>
+                      🏆 {r.winnerName ?? "?"}
+                    </span>
+                  </span>
+                  {r.traceAgent ? (
+                    <a
+                      className="btn small primary"
+                      href={traceUrl(r.gameId)}
+                      title={`Download ${r.traceAgent}'s CoT + tool trace (JSONL, chat format) for LLM training`}
+                      style={{ marginLeft: "auto" }}
+                    >
+                      ⬇ traces
+                    </a>
+                  ) : (
+                    <span className="chip" style={{ marginLeft: "auto", opacity: 0.55 }}>
+                      no trace
+                    </span>
+                  )}
                 </div>
               ))
             )}

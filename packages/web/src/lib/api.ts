@@ -65,3 +65,25 @@ export function createRoom(body: { mode: "blitz" | "classic"; seats: SeatSpec[] 
 export function listRooms(status: "live" | "recent"): Promise<{ rooms: RoomSummary[] }> {
   return jfetch<{ rooms: RoomSummary[] }>(`/api/rooms?status=${status}`);
 }
+
+// ------------------------------------------------------------- training data
+
+export interface ResultRow {
+  gameId: string;
+  mode: string;
+  winnerName: string | null;
+  turns: number;
+  players: string[];
+  finishedAt: number;
+  /** set when the winning seat is an LLM agent that uploaded its trace */
+  traceAgent: string | null;
+}
+
+export function listResults(limit = 20): Promise<{ results: ResultRow[] }> {
+  return jfetch<{ results: ResultRow[] }>(`/api/leaderboard?limit=${limit}`);
+}
+
+/** Direct download URL for a game's winner trace (served as application/x-ndjson). */
+export function traceUrl(gameId: string): string {
+  return `/api/rooms/${gameId}/trace`;
+}

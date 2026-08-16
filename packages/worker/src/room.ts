@@ -6,8 +6,6 @@ interface RoomMeta {
   recorded?: boolean;
 }
 
-const KEEPALIVE_AFTER_END_MS = 10 * 60_000;
-
 /**
  * One Durable Object per war room. Owns the authoritative Game instance.
  * Humans talk over WebSocket; agents talk via the /mcp route (which
@@ -69,6 +67,13 @@ export class GameRoom {
   /**
    * Advance bots / deadline-auto-play, persist, broadcast, and re-arm the
    * alarm for the next deadline. Cheap to call from any entry point.
+   *
+   * Note: when the game ENDS we deliberately do NOT re-arm the alarm. The room
+   * then hibernates (zero duration billing, zero DO requests) and rehydrates
+   * from SQLite on demand when anyone opens the share link or fetches the
+   * trace. Result recording happens in the worker's /api/rooms list (idempotent
+   * in the board), so finished games still show up without a keep-alive loop.
+   * (A forever-re-arming keepalive would drain the DO free-tier request quota.)
    */
   private async step(): Promise<void> {
     if (!this.game) return;
@@ -78,15 +83,7 @@ export class GameRoom {
     this.broadcast();
     if (this.game.state.status === "running" && this.game.state.turnOwner) {
       await this.state.storage.setAlarm(this.game.state.deadlineMs);
-    } else if (this.game.state.status === "over") {
-      const doneAt = this.lastChangeAt();
-      await this.state.storage.setAlarm(doneAt + KEEPALIVE_AFTER_END_MS);
     }
-  }
-
-  private lastChangeAt(): number {
-    const feed = this.game?.state.feed ?? [];
-    return feed.length ? feed[feed.length - 1].ts : this.now();
   }
 
   // --------------------------------------------------------------- fetch

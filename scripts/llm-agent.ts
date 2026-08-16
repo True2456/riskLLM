@@ -14,16 +14,24 @@
  * Run:  WORKER_URL=http://localhost:8787 \
  *       OPENROUTER_KEY=sk-or-... \
  *       npx tsx scripts/llm-agent.ts
+ *
+ * On a WIN, the agent's full CoT + tool-call trace is uploaded to the arena
+ * (POST /api/rooms/:id/trace) and written to ./traces/<game>-<agent>.jsonl for
+ * LLM training. See the format note at the top of the trace builder below.
  */
+
+import { mkdirSync, writeFileSync } from "node:fs";
+import { Pool, type LlmMsg, type Strategy } from "@riskllm/llm";
 
 // ---------------------------------------------------------------- config
 
 const BASE = process.env.WORKER_URL ?? "http://localhost:8787";
-const LLM_URL =
-  process.env.LLM_URL ?? "https://openrouter.ai/api/v1/chat/completions";
 const LLM_KEY = process.env.OPENROUTER_KEY ?? "";
-const LLM_MODEL = process.env.LLM_MODEL ?? "nvidia/nemotron-3.5-lightning:free";
-const AGENT_NAME = process.env.AGENT_NAME ?? "Nemotron";
+// Which provider to field this seat with: "auto" (free smart router, default),
+// "free" (free rotating), "ling" (cheap paid backstop), or "rotate" (round-robin).
+// The pool falls through free -> paid on 429 so a battle never stalls.
+const LLM_PROVIDER = (process.env.LLM_PROVIDER ?? "auto") as Strategy;
+const AGENT_NAME = process.env.AGENT_NAME ?? "Auto";
 const MAX_ACTIONS_PER_TURN = 30;
 const MAX_TURNS = 40;
 
@@ -31,6 +39,8 @@ if (!LLM_KEY) {
   console.error("set OPENROUTER_KEY");
   process.exit(1);
 }
+
+const pool = new Pool({ key: LLM_KEY, referer: BASE, title: "riskllm" });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -78,52 +88,15 @@ class Mcp {
 
 // ---------------------------------------------------------------- LLM client
 
-interface Msg {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
-  tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
-  tool_call_id?: string;
-  name?: string;
-}
+type Msg = LlmMsg;
 
+// One LLM decision, rotating across providers (free -> paid) on 429/error.
+let usedModel = `openrouter:${LLM_PROVIDER}`; // updated each call with the routed model
 async function llm(tools: any[], messages: Msg[]): Promise<Msg> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt < 6; attempt++) {
-    try {
-      const res = await fetch(LLM_URL, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${LLM_KEY}`,
-          "HTTP-Referer": "http://localhost",
-          "X-Title": "riskllm-agent",
-        },
-        body: JSON.stringify({ model: LLM_MODEL, messages, tools, tool_choice: "auto", temperature: 0.8, max_tokens: 1500 }),
-      });
-      if (res.status === 429) {
-        const wait = 8000 * (attempt + 1);
-        console.log(`  .. rate limited, waiting ${wait / 1000}s`);
-        await sleep(wait);
-        continue;
-      }
-      const data = await res.json();
-      if (!res.ok) throw new Error(`LLM ${res.status}: ${JSON.stringify(data).slice(0, 300)}`);
-      const m = data.choices[0].message as any;
-      return {
-        role: "assistant",
-        content: m.content ?? null,
-        tool_calls: m.tool_calls?.map((tc: any) => ({
-          id: tc.id,
-          type: "function" as const,
-          function: { name: tc.function.name, arguments: tc.function.arguments },
-        })),
-      };
-    } catch (e) {
-      lastErr = e;
-      await sleep(5000 * (attempt + 1));
-    }
-  }
-  throw new Error("LLM calls failed after retries: " + String(lastErr));
+  const res = await pool.call(tools, messages, LLM_PROVIDER);
+  usedModel = res.routedModel ?? res.provider.model;
+  console.log(`  [brain: ${res.provider.label}${res.routedModel ? ` → ${res.routedModel}` : ""}]`);
+  return res.message;
 }
 
 // ---------------------------------------------------------------- agent
@@ -155,7 +128,7 @@ async function main() {
   await mcp.rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: AGENT_NAME, version: "1" } }, 1);
   const mcpTools = await mcp.rpc("tools/list", {}, 2).then((r: any) => r.tools);
   const tools = mcpTools.map((t: any) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.inputSchema } }));
-  console.log(`MCP ok — ${tools.length} tools, LLM = ${LLM_MODEL}`);
+  console.log(`MCP ok — ${tools.length} tools, provider = ${LLM_PROVIDER} (${pool.status().filter(s=>s.available).map(s=>s.id).join("/")})`);
 
   const system = `You are ${AGENT_NAME}, commanding a country in a live game of Risk (RiskLLM).
 You play through tools — the ONLY way to act is calling a tool. Territory args accept the id (e.g. "ALA") or the name (e.g. "Alaska").
@@ -165,6 +138,38 @@ Strategy: consolidate one continent early; attack 1-army tiles with 2 dice, 2-ar
   const chat: Chat = { summary: "game just started" };
   const start = Date.now();
   let turns = 0;
+
+  // ---- training trace: one entry per assistant decision (prompt -> completion)
+  // Each line of the resulting JSONL is a self-contained SFT example:
+  //   { game, agent, model, turn, step, tools, messages, completion }
+  // `messages` is the full conversation up to (not including) `completion`, and
+  // `completion` is the assistant message (its `content` is the chain-of-thought,
+  // `tool_calls` the actions taken). This is the standard chat-format pair that
+  // OpenAI-finetune / LLaMA-Factory / TRL pipelines consume directly.
+  interface TraceLine {
+    game: string;
+    agent: string;
+    model: string;
+    turn: number;
+    step: number;
+    tools: unknown[];
+    messages: Msg[];
+    completion: Msg;
+  }
+  const trace: TraceLine[] = [];
+  let stepNo = 0;
+  const record = (turn: number, context: Msg[], completion: Msg) => {
+    trace.push({
+      game: gameId,
+      agent: AGENT_NAME,
+      model: usedModel,
+      turn,
+      step: stepNo++,
+      tools,
+      messages: context.map((m) => ({ ...m })),
+      completion,
+    });
+  };
 
   for (;;) {
     // ---- wait for my turn (long-poll, retry until it's mine) ----
@@ -197,7 +202,17 @@ Strategy: consolidate one continent early; attack 1-army tiles with 2 dice, 2-ar
     let n = 0;
     while (n < MAX_ACTIONS_PER_TURN && !ended) {
       n++;
-      const out = await llm(tools, msgs);
+      let out: Msg;
+      try {
+        out = await llm(tools, msgs);
+      } catch (e) {
+        // The free tier is rate-limited everywhere right now. Don't crash — end
+        // the turn; the seat's deadline autopilot will finish it and the game
+        // continues (the next turn may have free capacity again).
+        console.log(`  ⚠ LLM unavailable (${String((e as Error).message).slice(0, 90)}) — ending turn, autopilot finishes it`);
+        break;
+      }
+      record(turns, msgs, out); // snapshot the context BEFORE `out` is appended
       msgs.push(out);
       if (!out.tool_calls || out.tool_calls.length === 0) {
         noToolStreak++;
@@ -228,7 +243,7 @@ Strategy: consolidate one continent early; attack 1-army tiles with 2 dice, 2-ar
           break;
         }
       }
-      await sleep(250); // be gentle on the free tier
+      await sleep(1200); // be gentle on the free tier's per-minute limits
     }
 
     if (ended) break;
@@ -260,6 +275,38 @@ Strategy: consolidate one continent early; attack 1-army tiles with 2 dice, 2-ar
   for (const r of reps) console.log(`  ${r.name}: ${r.territories} terr, ${r.armies} armies${r.alive ? "" : " (eliminated)"}`);
   console.log("final feed (last 12):");
   for (const l of fs.feed.slice(-12)) console.log(`  t${l.turn} ${l.text}`);
+
+  // ---- publish the winner's training trace (LLM agents only) ----
+  if (trace.length > 0) {
+    const jsonl = trace.map((t) => JSON.stringify(t, null, 0)).join("\n") + "\n";
+    const slug = AGENT_NAME.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    try {
+      mkdirSync("traces", { recursive: true });
+      const file = `traces/${gameId}-${slug}.jsonl`;
+      writeFileSync(file, jsonl);
+      console.log(`\n📝 training trace saved locally: ${file} (${trace.length} steps, ${jsonl.length} bytes)`);
+    } catch (e) {
+      console.log("  ⚠ could not write local trace:", (e as Error).message);
+    }
+    if (youWon) {
+      try {
+        const up = await fetch(`${BASE}/api/rooms/${gameId}/trace`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${tokens.p1}` },
+          body: JSON.stringify({ agentName: AGENT_NAME, model: usedModel, content: jsonl, lines: trace.length }),
+        });
+        if (up.ok) {
+          console.log(`📤 WINNER's trace uploaded — the lobby now offers it at ${BASE}/api/rooms/${gameId}/trace`);
+        } else {
+          console.log(`  ⚠ trace upload failed: HTTP ${up.status} ${(await up.text()).slice(0, 120)}`);
+        }
+      } catch (e) {
+        console.log("  ⚠ trace upload failed:", (e as Error).message);
+      }
+    } else {
+      console.log("  (not the winner — trace kept local only, not published)");
+    }
+  }
   process.exit(0);
 }
 

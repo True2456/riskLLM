@@ -4,9 +4,10 @@ import { handleMcpRequest } from "./mcp";
 import { makeToken, verifyToken, bearer } from "./token";
 import { GameRoom } from "./room";
 import { Board } from "./board";
+import { League } from "./league";
 
 // Durable Object classes (referenced by wrangler.toml)
-export { GameRoom, Board };
+export { GameRoom, Board, League };
 
 const BOT_STYLES: BotStyle[] = ["aggressive", "balanced", "turtle"];
 const KINDS: PlayerKind[] = ["human", "agent", "bot"];
@@ -56,6 +57,24 @@ async function handleApi(request: Request, url: URL, env: Env): Promise<Response
 
   if (path === "/api/health" && request.method === "GET") {
     return json({ ok: true });
+  }
+
+  // The always-on LLM league: status + start-a-battle.
+  if (path === "/api/league" && request.method === "GET") {
+    const res = await env.LEAGUE.get(env.LEAGUE.idFromName("main")).fetch(`http://internal/league`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "status" }),
+    });
+    return new Response(await res.text(), { status: res.status, headers: { "content-type": "application/json", "access-control-allow-origin": "*" } });
+  }
+  if (path === "/api/league/start" && request.method === "POST") {
+    const res = await env.LEAGUE.get(env.LEAGUE.idFromName("main")).fetch(`http://internal/league`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "start" }),
+    });
+    return new Response(await res.text(), { status: res.status, headers: { "content-type": "application/json", "access-control-allow-origin": "*" } });
   }
 
   if (path === "/api/rooms" && request.method === "POST") {
@@ -118,10 +137,38 @@ async function handleApi(request: Request, url: URL, env: Env): Promise<Response
     const detailed = await Promise.all(
       rooms.map(async (r) => {
         const res = await roomOp(env, r.gameId, { op: "lobby" });
-        return res?.body ?? null;
+        const body = res?.body ?? null;
+        // Record finished games on the board as the list is polled (idempotent
+        // in the board — it dedups by gameId). This is the reliable recorder now
+        // that rooms no longer keep-alive after the game ends.
+        if (body && body.status === "over" && body.winner) {
+          const winnerName: string =
+            (body.players ?? []).find((p: { id: string; name: string }) => p.id === body.winner)?.name ??
+            body.winner;
+          await board.fetch(`http://internal/board`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              op: "recordResult",
+              gameId: r.gameId,
+              mode: body.mode,
+              winner: body.winner,
+              winnerName,
+              turns: body.turn,
+              players: (body.players ?? []).map((p: { name: string }) => p.name),
+            }),
+          }).catch(() => {});
+        }
+        return body;
       }),
     );
-    return json({ rooms: detailed.filter(Boolean) });
+    const allRooms = detailed.filter(Boolean);
+    const want = url.searchParams.get("status");
+    const roomsOut =
+      want === "live" ? allRooms.filter((r) => r.status === "running")
+      : want === "recent" ? allRooms.filter((r) => r.status === "over")
+      : allRooms;
+    return json({ rooms: roomsOut });
   }
 
   const roomMatch = path.match(/^\/api\/rooms\/([a-z0-9]{6,16})$/);
@@ -148,6 +195,69 @@ async function handleApi(request: Request, url: URL, env: Env): Promise<Response
       });
     }
     return json({ state, reports });
+  }
+
+  // --------------------------------------------------------- training traces
+  // LLM agents upload their CoT/tool-call trace (JSONL) after a game. Only the
+  // WINNER's trace is surfaced (the board flags the result row when the
+  // uploading seat is the recorded winner). GET is public — it's training data.
+  const traceMatch = path.match(/^\/api\/rooms\/([a-z0-9]{6,16})\/trace$/);
+  if (traceMatch && request.method === "GET") {
+    const gameId = traceMatch[1];
+    const board = env.BOARD.get(env.BOARD.idFromName("main"));
+    const res = await board.fetch(`http://internal/board`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "getTrace", gameId }),
+    });
+    if (res.status !== 200) {
+      return new Response(await res.text(), {
+        status: res.status,
+        headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+      });
+    }
+    const data = (await res.json()) as { agentName: string; content: string };
+    const safe = (data.agentName || "agent").replace(/[^a-z0-9-_]+/gi, "_").toLowerCase();
+    return new Response(data.content, {
+      status: 200,
+      headers: {
+        "content-type": "application/x-ndjson; charset=utf-8",
+        "content-disposition": `attachment; filename="${gameId}-${safe}.jsonl"`,
+        "access-control-allow-origin": "*",
+      },
+    });
+  }
+  if (traceMatch && request.method === "POST") {
+    const gameId = traceMatch[1];
+    const token = bearer(request);
+    if (!token) return json({ error: "missing bearer token" }, 401);
+    const seat = await verifyToken(token, secret);
+    if (!seat || seat.gameId !== gameId) return json({ error: "invalid token for this game" }, 401);
+    const body = (await request.json().catch(() => ({}))) as {
+      agentName?: string;
+      model?: string;
+      content?: string;
+      lines?: number;
+    };
+    if (!body.content) return json({ error: "content required (JSONL string)" }, 400);
+    const board = env.BOARD.get(env.BOARD.idFromName("main"));
+    const res = await board.fetch(`http://internal/board`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        op: "uploadTrace",
+        gameId,
+        seatId: seat.playerId,
+        agentName: body.agentName ?? "",
+        model: body.model ?? "",
+        content: body.content,
+        lines: body.lines ?? 0,
+      }),
+    });
+    return new Response(await res.text(), {
+      status: res.status,
+      headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+    });
   }
 
   if (path === "/api/leaderboard" && request.method === "GET") {

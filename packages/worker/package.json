@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",
-    "@riskllm/engine": "*"
+    "@riskllm/engine": "*",
+    "@riskllm/llm": "*"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20251231.0",

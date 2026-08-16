@@ -30,7 +30,24 @@ export class Board {
           players TEXT,
           finishedAt INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS traces (
+          gameId TEXT NOT NULL,
+          seatId TEXT NOT NULL,
+          agentName TEXT NOT NULL,
+          model TEXT,
+          uploadedAt INTEGER NOT NULL,
+          lines INTEGER NOT NULL,
+          content TEXT NOT NULL,
+          PRIMARY KEY (gameId, seatId)
+        );
       `);
+      // Guarded migration: add traceAgent to pre-existing results tables
+      // (no-op error if the column is already there).
+      try {
+        sql.exec(`ALTER TABLE results ADD COLUMN traceAgent TEXT`);
+      } catch {
+        /* already exists */
+      }
       this.ready = true;
     }
     return sql;
@@ -47,6 +64,11 @@ export class Board {
       turns?: number;
       players?: string[];
       limit?: number;
+      seatId?: string;
+      agentName?: string;
+      model?: string;
+      content?: string;
+      lines?: number;
     };
     const sql = await this.db();
     const now = Date.now();
@@ -99,7 +121,7 @@ export class Board {
       case "listResults": {
         const limit = Math.min(100, body.limit ?? 50);
         const rows = sql
-          .exec(`SELECT gameId, mode, winnerName, turns, players, finishedAt FROM results ORDER BY finishedAt DESC LIMIT ?1`, limit)
+          .exec(`SELECT gameId, mode, winnerName, turns, players, finishedAt, traceAgent FROM results ORDER BY finishedAt DESC LIMIT ?1`, limit)
           .toArray() as unknown as Record<string, unknown>[];
         return json({
           results: rows.map((r) => ({
@@ -109,7 +131,61 @@ export class Board {
             turns: Number(r.turns),
             players: JSON.parse(String(r.players ?? "[]")) as string[],
             finishedAt: Number(r.finishedAt),
+            traceAgent: (r.traceAgent as string | null) ?? null,
           })),
+        });
+      }
+      case "uploadTrace": {
+        const { gameId, seatId, agentName, model, content, lines } = body;
+        if (!gameId || !seatId || !content) return json({ error: "gameId, seatId, content required" }, 400);
+        sql.exec(
+          `INSERT OR REPLACE INTO traces (gameId, seatId, agentName, model, uploadedAt, lines, content)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+          gameId, seatId, agentName ?? "", model ?? "", now, lines ?? 0, content,
+        );
+        // If this seat is the game's winner, flag the result row so the lobby
+        // can show the download button. Losing traces are stored but not flagged.
+        sql.exec(`UPDATE results SET traceAgent = ?3 WHERE gameId = ?1 AND winner = ?2`,
+          gameId, seatId, agentName ?? "");
+        return json({ ok: true, stored: true });
+      }
+      case "getTrace": {
+        const gameId = body.gameId ?? "";
+        if (!gameId) return json({ error: "gameId required" }, 400);
+        // Winner's trace: join traces to results where the trace's seat is the
+        // recorded winner (results.winner holds the winning seatId).
+        const row = sql
+          .exec(
+            `SELECT t.agentName, t.model, t.lines, t.content, t.uploadedAt, r.winnerName
+             FROM traces t JOIN results r ON r.gameId = t.gameId
+             WHERE t.gameId = ?1 AND r.winner = t.seatId`,
+            gameId,
+          )
+          .one() as unknown as Record<string, unknown> | null;
+        if (row) {
+          return json({
+            gameId,
+            agentName: String(row.agentName),
+            winnerName: (row.winnerName as string | null) ?? null,
+            model: (row.model as string | null) ?? null,
+            lines: Number(row.lines),
+            uploadedAt: Number(row.uploadedAt),
+            content: String(row.content),
+          });
+        }
+        // Fallback: the only trace on record for this game.
+        const solo = sql
+          .exec(`SELECT agentName, model, lines, content, uploadedAt FROM traces WHERE gameId = ?1 LIMIT 1`, gameId)
+          .one() as unknown as Record<string, unknown> | null;
+        if (!solo) return json({ error: "no trace for this game" }, 404);
+        return json({
+          gameId,
+          agentName: String(solo.agentName),
+          winnerName: null,
+          model: (solo.model as string | null) ?? null,
+          lines: Number(solo.lines),
+          uploadedAt: Number(solo.uploadedAt),
+          content: String(solo.content),
         });
       }
       default:
